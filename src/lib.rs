@@ -2,6 +2,7 @@
 
 //! A blockchain-agnostic Rust Coinselection library
 
+use rand::rngs::ThreadRng;
 use rand::{seq::SliceRandom, thread_rng, Rng};
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -98,24 +99,150 @@ pub struct SelectionOutput {
     pub waste: WasteMetric,
 }
 
-/// Perform Coinselection via Branch And Bound algorithm.
+/// Perform Coinselection via Branch And Bound algorithm, follow first algorithm
 pub fn select_coin_bnb(
     inputs: &[OutputGroup],
-    options: CoinSelectionOpt,
+    options: &CoinSelectionOpt,
 ) -> Result<SelectionOutput, SelectionError> {
-    unimplemented!()
+    // create an input vector with sorted in descending order
+    let mut inputs_desc: Vec<(usize, &OutputGroup)> = inputs.into_iter().enumerate().collect();
+
+    inputs_desc.sort_by(|a, b| b.1.value.cmp(&a.1.value));
+
+    let selected_inputs = bnb(inputs, &inputs_desc, &[], 0, 0, 0, 1_000_000, options);
+    let mut total_value = 0;
+
+    if selected_inputs.is_empty() {
+        //Fallback to Single Random Draw
+        let mut shuffeled_pool: Vec<(usize, &OutputGroup)> = inputs_desc;
+        shuffeled_pool.shuffle(&mut rand::thread_rng());
+
+        let mut selected_coins = Vec::new();
+        let mut total_value = 0;
+        let mut total_weight = options.base_weight;
+
+        while total_value
+            < options.target_value
+                + calculate_fee(total_weight, options.target_feerate)
+                + options.min_drain_value
+        {
+            if let Some((index, coin)) = shuffeled_pool.pop() {
+                selected_coins.push(index);
+                total_value += coin.value;
+                total_weight += coin.weight;
+            } else {
+                return Err(SelectionError::InsufficientFunds);
+            }
+        }
+
+        let estimated_fee = calculate_fee(total_weight, options.target_feerate);
+        let waste = calculate_waste(
+            inputs,
+            &selected_coins,
+            &options,
+            total_value,
+            total_weight,
+            estimated_fee,
+        );
+
+        Ok(SelectionOutput {
+            selected_inputs: selected_coins,
+            waste: WasteMetric(waste),
+        })
+    } else {
+        let total_value: u64 = selected_inputs
+            .iter()
+            .map(|&index| inputs[index].value)
+            .sum();
+        let total_weight: u32 = options.base_weight
+            + selected_inputs
+                .iter()
+                .map(|&index| inputs[index].weight)
+                .sum::<u32>();
+        let estimated_fee = calculate_fee(total_weight, options.target_feerate);
+        let waste = calculate_waste(
+            inputs,
+            &selected_inputs,
+            &options,
+            total_value,
+            total_weight,
+            estimated_fee,
+        );
+        Ok(SelectionOutput {
+            selected_inputs,
+            waste: WasteMetric(waste),
+        })
+    }
 }
 
-/// Return empty vec if no solutions are found
+/// Return empty vec if no solutions are found, follow second algorithm
 fn bnb(
-    inputs_in_desc_value: &[(usize, OutputGroup)],
+    inputs: &[OutputGroup],
+    inputs_in_desc_value: &Vec<(usize, &OutputGroup)>,
     selected_inputs: &[usize],
     effective_value: u64,
-    depth: usize,
-    bnp_tries: u32,
+    accumulated_value: u64,
+    accumulated_weight: u32,
+    mut bnb_tries: u32,
     options: &CoinSelectionOpt,
 ) -> Vec<usize> {
-    unimplemented!()
+    if bnb_tries == 0 {
+        return Vec::new();
+    }
+    bnb_tries -= 1;
+
+    let target = options.target_value;
+    let estimated_fee = calculate_fee(accumulated_weight, options.target_feerate);
+    let cost_of_change = options.drain_cost + options.cost_per_output;
+
+    match effective_value.cmp(&target) {
+        Ordering::Greater if effective_value > target + cost_of_change => return Vec::new(),
+        Ordering::Greater | Ordering::Equal => return selected_inputs.to_vec(),
+        _ if selected_inputs.len() == inputs.len() => return Vec::new(),
+        _ => {}
+    }
+
+    let depth = selected_inputs.len();
+    let (index, current_input) = inputs_in_desc_value[depth];
+    let current_effective_value = effective_value(current_input, options.target_feerate);
+
+    // Randomly decide whether to include or exclude the current input first
+    let (first, second) = if rand::random() {
+        (true, false)
+    } else {
+        (false, true)
+    };
+
+    for include in [first, second] {
+        let mut new_selection = selected_inputs.to_vec();
+        let (new_effective_value, new_accumulated_value, new_accumulated_weight) = if include {
+            new_selection.push(index);
+            (
+                effective_value + current_effective_value,
+                accumulated_value + current_input.value,
+                accumulated_weight + current_input.weight,
+            )
+        } else {
+            (effective_value, accumulated_value, accumulated_weight)
+        };
+
+        let result = bnb(
+            inputs,
+            inputs_in_desc_value_desc,
+            &new_selection,
+            new_effective_value,
+            new_accumulated_value,
+            new_accumulated_weight,
+            bnb_tries,
+            options,
+        );
+
+        if !result.is_empty() {
+            return result;
+        }
+    }
+
+    Vec::new()
 }
 
 /// Perform Coinselection via Knapsack solver.
